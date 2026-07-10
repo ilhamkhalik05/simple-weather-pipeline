@@ -1,0 +1,27 @@
+name: Daily Weather ETL Execution
+
+on:
+  schedule:
+    # Running everyday at 02:00 UTC (09:00 WIB)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Spin up Postgres and Run Pipeline using Docker Compose
+      env:
+        DATABASE_HOST: postgres-db
+        DATABASE_PORT: 5432
+        DATABASE_USER: ${{ secrets.DB_USER }}
+        DATABASE_PASS: ${{ secrets.DB_PASS }}
+        DATABASE_NAME: ${{ secrets.DB_NAME }}
+      run: |
+        docker-compose up -d postgres-db
+        docker-compose run weather-pipeline python pipeline.py
+        docker-compose down

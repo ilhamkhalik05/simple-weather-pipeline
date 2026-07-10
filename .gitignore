@@ -1,0 +1,38 @@
+# Environments
+venv/
+.venv/
+env/
+ENV/
+.python-version   
+
+# Python bytecode and cache
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so   
+.cache.*
+.pytest_cache/
+.cache/
+
+# Sensitive and local data
+.env
+.env.local
+*.db
+*.sqlite3
+*.log  
+*.csv
+*.json 
+
+# VSCode Spesifics
+.vscode
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json   
+
+# Distribution and packaging
+dist/
+build/
+*.egg-info/
+*.egg   
