@@ -1,27 +1,44 @@
-name: Daily Weather ETL Execution
+name: Daily Weather Pipeline Execution (GitOps Data Lake)
 
 on:
   schedule:
-    # Running everyday at 02:00 UTC (09:00 WIB)
+    # Running everydat at 02:00 UTC
     - cron: '0 2 * * *'
-  workflow_dispatch:
+
+  # Allowing execution manually on GitHub
+  workflow_dispatch: 
 
 jobs:
-  run-pipeline:
+  run-pipeline-and-save:
     runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
 
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Spin up Postgres and Run Pipeline using Docker Compose
-      env:
-        DATABASE_HOST: postgres-db
-        DATABASE_PORT: 5432
-        DATABASE_USER: ${{ secrets.DB_USER }}
-        DATABASE_PASS: ${{ secrets.DB_PASS }}
-        DATABASE_NAME: ${{ secrets.DB_NAME }}
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Dependencies
       run: |
-        docker-compose up -d postgres-db
-        docker-compose run weather-pipeline python pipeline.py
-        docker-compose down
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Execute Polars Pipeline
+      run: |
+        python pipeline.py
+
+    - name: Commit and Push Parquet Files to GitHub Storage
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        
+        git add data/
+        
+        git diff --quiet && git diff --staged --quiet || git commit -m "data: Auto-update daily weather profiles [skip ci]"
+        git push

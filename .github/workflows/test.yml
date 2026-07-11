@@ -11,22 +11,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    
-    # Setup fake database service on Github cloud for testing
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
-          POSTGRES_DB: test_db
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
 
     steps:
     - name: Checkout Repository
@@ -42,12 +26,6 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run Pytest (Unit & Integration)
-      env:
-        DATABASE_HOST: localhost
-        DATABASE_PORT: 5432
-        DATABASE_USER: test_user
-        DATABASE_PASS: test_password
-        DATABASE_NAME: test_db
+    - name: Run Pytest (Unit & Data Quality)
       run: |
         pytest tests/ -v

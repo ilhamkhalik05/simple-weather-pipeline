@@ -1,44 +1,9 @@
 version: '3.8'
 
 services:
-  # Service 1: PostgreSQL Database
-  postgres-db:
-    image: postgres:15-alpine
-    container_name: weather_warehouse
-    env_file: 
-      - .env
-    environment:
-      POSTGRES_USER: ${DATABASE_USER:-ammm_de}
-      POSTGRES_PASSWORD: ${DATABASE_PASS:-supersecret}
-      POSTGRES_DB: ${DATABASE_NAME:-weather_forecast_dataset}
-    ports:
-      - "5432:5432"
-    volumes:
-      # Keep data when container is off
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-ammm_de} -d ${DATABASE_NAME:-weather_forecast_dataset}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  # Service 2: ELT Pipeline
-  elt-pipeline:
+  weather-pipeline:
     build: .
     container_name: weather_pipeline_runner
-    env_file: 
-      - .env
-    depends_on:
-      postgres-db:
-        condition: service_healthy
-    environment:
-      # Inject environment variables from .env (if running on local)
-      DATABASE_HOST: postgres-db
-      DATABASE_PORT: 5432
-      DATABASE_USER: ${DATABASE_USER:-ammm_de}
-      DATABASE_PASS: ${DATABASE_PASS:-supersecret}
-      DATABASE_NAME: ${DATABASE_NAME:-weather_forecast_dataset}
+    volumes:
+      - ./data:/app/data
     command: ["python", "pipeline.py"]
-
-volumes:
-  postgres_data:

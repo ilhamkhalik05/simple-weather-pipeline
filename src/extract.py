@@ -1,6 +1,7 @@
-import pandas as pd
 import openmeteo_requests
 import requests_cache
+import polars as pl
+import numpy as np
 from retry_requests import retry
 from loguru import logger
 
@@ -38,26 +39,27 @@ def fetch_weather_data() -> object:
     try:
         responses = openmeteo.weather_api(API_URL, params=params)
         logger.success("Weather data fetched successfully from API.")
-        return responses[0]
+        return responses[0]  # Return the first location fetched
     except Exception as e:
         logger.error(f"Failed to fetch data from Open-Meteo API: {e}")
         raise
 
 
-def process_weather_response(response: object) -> pd.DataFrame:
-    logger.info("Transforming raw API response into Pandas DataFrame...")
+def process_weather_response(response: object) -> pl.DataFrame:
+    """
+    Transforms the raw Open-Meteo API response into a Polars DataFrame.
+    """
+    logger.info("Transforming raw API response directly into Polars DataFrame...")
 
+    # Get hourly weather forecast data
     hourly = response.Hourly()
 
-    # Construct structured dictionary from Numpy arrays
+    # Generate Numpy array for UNIX timestamps based on API metadata
+    time_array = np.arange(hourly.Time(), hourly.TimeEnd(), hourly.Interval())
+
+    # Construct structured dictionary directly from Open-Meteo Numpy arrays
     hourly_data = {
-        "location": TARGET_LOCATION["location"],
-        "date": pd.date_range(
-            start=pd.to_datetime(hourly.Time(), unit="s", utc=True),
-            end=pd.to_datetime(hourly.TimeEnd(), unit="s", utc=True),
-            freq=pd.Timedelta(seconds=hourly.Interval()),
-            inclusive="left",
-        ),
+        "date": time_array,  # UNIX Timestamps
         "temperature_2m": hourly.Variables(0).ValuesAsNumpy(),
         "relative_humidity_2m": hourly.Variables(1).ValuesAsNumpy(),
         "precipitation": hourly.Variables(2).ValuesAsNumpy(),
@@ -65,7 +67,16 @@ def process_weather_response(response: object) -> pd.DataFrame:
         "weather_code": hourly.Variables(4).ValuesAsNumpy(),
     }
 
-    df_weather = pd.DataFrame(data=hourly_data)
+    df_weather = pl.DataFrame(hourly_data)
+
+    # Cast UNIX timestamp to Datetime (UTC) and append the location string
+    df_weather = df_weather.with_columns(
+        [
+            pl.from_epoch(pl.col("date"), time_unit="s").dt.replace_time_zone("UTC"),
+            pl.lit(TARGET_LOCATION["location"]).alias("location"),
+        ]
+    )
+
     logger.info(f"Transformation complete. Generated {len(df_weather)} rows of data.")
 
     return df_weather

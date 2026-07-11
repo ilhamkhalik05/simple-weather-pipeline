@@ -1,11 +1,9 @@
 from loguru import logger
 from src.extract import fetch_weather_data, process_weather_response
-from src.db_manager import PostgresManager
 from src.pipeline_manager import WeatherELTPipeline
-from src.config.db_config import get_db_config
 
-BRONZE_TABLE = "bronze.raw_weather"
-SILVER_TABLE = "silver.cleaned_weather"
+# Will act as a file-based data lake for our weather data
+OUTPUT_DATA_DIR = "data"
 
 
 def main():
@@ -15,16 +13,12 @@ def main():
         raw_response = fetch_weather_data()
         df_weather = process_weather_response(raw_response)
 
-        db_config = get_db_config()
+        elt_pipeline = WeatherELTPipeline(OUTPUT_DATA_DIR)
 
-        # Dependency Injection: We pass the DB context into our pipeline logic
-        with PostgresManager(db_config) as db:
-            elt_pipeline = WeatherELTPipeline(db, BRONZE_TABLE, SILVER_TABLE)
-
-            # Execute Medallion Architecture Flow
-            elt_pipeline.load_bronze_layer(df_weather)
-            elt_pipeline.process_silver_layer()
-            elt_pipeline.process_gold_layer()
+        # Execute Medallion Architecture Flow
+        elt_pipeline.load_bronze_layer(df_weather)
+        elt_pipeline.process_silver_layer()
+        elt_pipeline.process_gold_layer()
 
         logger.success("--- Pipeline Execution Finished Successfully ---")
 

@@ -1,303 +1,164 @@
-import pandas as pd
+import os
+import polars as pl
 from loguru import logger
-from src.db_manager import PostgresManager
+from datetime import datetime
 
 
 class WeatherELTPipeline:
     """
-    Manages the Medallion Architecture data flow (Bronze -> Silver -> Gold).
-    Requires an active PostgresManager instance to execute database operations.
+    Manages the File-Based Medallion Architecture (Bronze -> Silver -> Gold)
+    using Polars and Parquet storage for high scalability and zero-cloud cost.
     """
 
-    def __init__(self, db: PostgresManager, bronze_table: str, silver_table: str):
-        self.db = db
-        self.bronze_table = bronze_table
-        self.silver_table = silver_table
+    def __init__(self, base_data_dir: str = "data"):
+        self.base_dir = base_data_dir
+        self.bronze_dir = os.path.join(base_data_dir, "bronze")
+        self.silver_dir = os.path.join(base_data_dir, "silver")
+        self.gold_dir = os.path.join(base_data_dir, "gold")
+
+        # Ensure data lake directories exist locally or inside GitHub container
+        os.makedirs(self.bronze_dir, exist_ok=True)
+        os.makedirs(self.silver_dir, exist_ok=True)
+        os.makedirs(self.gold_dir, exist_ok=True)
 
     # ---------------------------------------------------------
     # BRONZE LAYER (RAW DATA)
     # ---------------------------------------------------------
-    def load_bronze_layer(self, df: pd.DataFrame) -> None:
-        """Dumps raw DataFrame directly into the Bronze layer."""
-        logger.info(
-            f"Loading {len(df)} records into Bronze layer ({self.bronze_table})..."
-        )
+    def load_bronze_layer(self, df_raw: pl.DataFrame) -> None:
+        """Dumps raw Polars DataFrame directly into Bronze Parquet file."""
+        logger.info("Ingesting raw API logs into Bronze Layer...")
 
-        data_to_insert = [tuple(row) for row in df.itertuples(index=False)]
+        # Add metadata auditing column seamlessly
+        df_raw = df_raw.with_columns(pl.lit(datetime.now()).alias("extracted_at"))
 
-        self.db.execute_query(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.bronze_table} (
-                id SERIAL PRIMARY KEY,
-                location VARCHAR,
-                date TIMESTAMPTZ,
-                temperature_2m FLOAT,
-                relative_humidity_2m FLOAT,
-                precipitation FLOAT,
-                precipitation_probability FLOAT,
-                weather_code FLOAT,
-                extracted_at TIMESTAMP DEFAULT now(),
-                UNIQUE (date)
-            );
-        """
-        )
+        # Target path for bronze snapshot
+        target_path = os.path.join(self.bronze_dir, "raw_weather.parquet")
 
-        upsert_query = f"""
-            INSERT INTO {self.bronze_table} 
-            (location, date, temperature_2m, relative_humidity_2m, precipitation, precipitation_probability, weather_code)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (date) 
-            DO UPDATE SET 
-                temperature_2m = EXCLUDED.temperature_2m,
-                relative_humidity_2m = EXCLUDED.relative_humidity_2m,
-                precipitation = EXCLUDED.precipitation,
-                precipitation_probability = EXCLUDED.precipitation_probability,
-                weather_code = EXCLUDED.weather_code,
-                extracted_at = now();
-        """
-        self.db.executemany_records(upsert_query, data_to_insert)
-
-        logger.success("Bronze load complete.")
+        # Idempotent write: Overwrite or create fresh snapshot
+        df_raw.write_parquet(target_path)
+        logger.success(f"Bronze layer saved successfully at: {target_path}")
 
     # ---------------------------------------------------------
     # SILVER LAYER (CLEANED & CONFORMED)
     # ---------------------------------------------------------
     def process_silver_layer(self) -> None:
-        """Incrementally cleans and standardizes data from Bronze to Silver."""
-        logger.info(f"Processing Silver layer ({self.silver_table})...")
+        """Incrementally cleans, dedupes, and casts data types from Bronze to Silver."""
+        logger.info("Processing Silver layer transformations...")
 
-        self.db.execute_query(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.silver_table} (
-                id SERIAL PRIMARY KEY,
-                location VARCHAR(100) NOT NULL,
-                date TIMESTAMPTZ NOT NULL,
-                temperature_2m NUMERIC(5,2),
-                relative_humidity_2m NUMERIC(5,2),
-                precipitation NUMERIC(6,2),
-                precipitation_probability NUMERIC(5,2),
-                weather_code INT,
-                transformed_at TIMESTAMPTZ DEFAULT now(),
-                UNIQUE (location, date)
-            );
-        """
+        bronze_path = os.path.join(self.bronze_dir, "raw_weather.parquet")
+        if not os.path.exists(bronze_path):
+            raise FileNotFoundError(
+                "Bronze source file missing. Aborting Silver stage."
+            )
+
+        df_bronze = pl.read_parquet(bronze_path)
+
+        # Apply Data Quality & Data Conforming rules
+        df_cleaned = df_bronze.with_columns(
+            [
+                pl.col("location").cast(pl.Utf8),
+                pl.col("date").cast(pl.Datetime),
+                pl.col("temperature_2m").cast(pl.Float32),
+                pl.col("relative_humidity_2m").cast(pl.Float32),
+                pl.col("precipitation").cast(pl.Float32),
+                pl.col("precipitation_probability").cast(pl.Float32),
+                pl.col("weather_code").cast(
+                    pl.Int32
+                ),  # Cast WMO code from Float to Int
+            ]
         )
 
-        checkpoint_date = self.db.fetch_one(
-            f"SELECT COALESCE(MAX(date), '1970-01-01'::TIMESTAMPTZ) FROM {self.silver_table}"
-        )[0]
+        # Enforce Idempotency: Deduplicate rows based on location and date window
+        df_cleaned = df_cleaned.unique(subset=["location", "date"], keep="last")
 
-        sql_query = f"""
-            WITH new_raw_data AS (
-                SELECT 
-                    location, date,
-                    temperature_2m::NUMERIC(5,2) AS temperature_2m,
-                    relative_humidity_2m::NUMERIC(5,2) AS relative_humidity_2m,
-                    precipitation::NUMERIC(6,2) AS precipitation,
-                    precipitation_probability::NUMERIC(5,2) AS precipitation_probability,
-                    weather_code::INT AS weather_code
-                FROM {self.bronze_table}
-                WHERE date > %s
-            )
-            INSERT INTO {self.silver_table} 
-                (location, date, temperature_2m, relative_humidity_2m, precipitation, precipitation_probability, weather_code)
-            SELECT * FROM new_raw_data
-            ON CONFLICT (location, date) 
-            DO UPDATE SET 
-                temperature_2m = EXCLUDED.temperature_2m,
-                relative_humidity_2m = EXCLUDED.relative_humidity_2m,
-                precipitation = EXCLUDED.precipitation,
-                precipitation_probability = EXCLUDED.precipitation_probability,
-                weather_code = EXCLUDED.weather_code,
-                transformed_at = now();
-        """
-        self.db.execute_query(sql_query, (checkpoint_date,))
-        rows_affected = self.db.cur.rowcount
-
-        if rows_affected > 0:
-            logger.success(
-                f"Silver processing complete. {rows_affected} rows updated/inserted."
-            )
-        else:
-            logger.info("Silver layer is already up-to-date.")
+        # Save to Silver Layer
+        silver_path = os.path.join(self.silver_dir, "cleaned_weather.parquet")
+        df_cleaned.write_parquet(silver_path)
+        logger.success(f"Silver layer cleaned and saved at: {silver_path}")
 
     # ---------------------------------------------------------
     # GOLD LAYER (STAR SCHEMA AGGREGATION)
     # ---------------------------------------------------------
     def process_gold_layer(self) -> None:
-        """Builds the analytical Star Schema incrementally."""
-        logger.info("Processing Gold layer (Star Schema)...")
+        """Transforms conformed Silver data into analytical Star Schema Parquet files."""
+        logger.info("Processing Gold layer dimensional aggregation...")
 
-        self.db.execute_query("CREATE SCHEMA IF NOT EXISTS gold;")
+        silver_path = os.path.join(self.silver_dir, "cleaned_weather.parquet")
+        if not os.path.exists(silver_path):
+            raise FileNotFoundError("Silver source file missing. Aborting Gold stage.")
 
-        self._initialize_gold_schema()
-        self._upsert_dimensions()
-        self._upsert_fact_hourly()
-        self._upsert_fact_daily_summary()
+        df_silver = pl.read_parquet(silver_path)
 
-        logger.success("Gold processing complete.")
-
-    def _initialize_gold_schema(self) -> None:
-        """Creates the DDL for the dimensional model."""
-        self.db.execute_query(
-            """
-            CREATE TABLE IF NOT EXISTS gold.dim_location (
-                location_key SERIAL PRIMARY KEY,
-                location_name VARCHAR(100) NOT NULL UNIQUE
-            );
-        """
-        )
-        self.db.execute_query(
-            """
-            CREATE TABLE IF NOT EXISTS gold.dim_date (
-                date_key INT PRIMARY KEY,
-                full_date DATE NOT NULL UNIQUE,
-                day_of_week INT NOT NULL,
-                day_name VARCHAR(10) NOT NULL,
-                month_actual INT NOT NULL,
-                month_name VARCHAR(10) NOT NULL,
-                year_actual INT NOT NULL,
-                quarter_actual INT NOT NULL
-            );
-        """
-        )
-        self.db.execute_query(
-            """
-            CREATE TABLE IF NOT EXISTS gold.fact_weather_hourly (
-                fact_hourly_id SERIAL PRIMARY KEY,
-                date_key INT NOT NULL REFERENCES gold.dim_date(date_key),
-                location_key INT NOT NULL REFERENCES gold.dim_location(location_key),
-                timestamp_utc TIMESTAMPTZ NOT NULL,
-                temperature_2m NUMERIC(5,2),
-                relative_humidity_2m NUMERIC(5,2),
-                precipitation NUMERIC(6,2),
-                precipitation_probability NUMERIC(5,2),
-                weather_code INT,
-                CONSTRAINT uq_fact_hourly UNIQUE (location_key, timestamp_utc)
-            );
-        """
-        )
-        self.db.execute_query(
-            """
-            CREATE TABLE IF NOT EXISTS gold.fact_weather_daily_summary (
-                fact_daily_id SERIAL PRIMARY KEY,
-                date_key INT NOT NULL REFERENCES gold.dim_date(date_key),
-                location_key INT NOT NULL REFERENCES gold.dim_location(location_key),
-                max_temperature NUMERIC(5,2),
-                min_temperature NUMERIC(5,2),
-                avg_temperature NUMERIC(5,2),
-                total_precipitation NUMERIC(6,2),
-                max_precipitation_probability NUMERIC(5,2),
-                CONSTRAINT uq_fact_daily UNIQUE (location_key, date_key)
-            );
-        """
-        )
-        self.db.execute_query(
-            "CREATE INDEX IF NOT EXISTS idx_fact_hourly_date ON gold.fact_weather_hourly(date_key);"
-        )
-        self.db.execute_query(
-            "CREATE INDEX IF NOT EXISTS idx_fact_daily_date ON gold.fact_weather_daily_summary(date_key);"
+        # Populate Dim Location
+        df_dim_location = df_silver.select(
+            pl.col("location").alias("location_name")
+        ).unique()
+        # Generate surrogate integer key via row numbers
+        df_dim_location = df_dim_location.with_row_index(name="location_key", offset=1)
+        df_dim_location.write_parquet(
+            os.path.join(self.gold_dir, "dim_location.parquet")
         )
 
-    def _upsert_dimensions(self) -> None:
-        """Populates Location and Date dimensions from Silver."""
-        self.db.execute_query(
-            f"""
-            INSERT INTO gold.dim_location (location_name)
-            SELECT DISTINCT location FROM {self.silver_table}
-            ON CONFLICT (location_name) DO NOTHING;
-        """
+        # Populate Dim Date
+        df_dim_date = df_silver.select(pl.col("date")).unique()
+        df_dim_date = df_dim_date.with_columns(
+            [
+                pl.col("date").dt.strftime("%Y%m%d").cast(pl.Int32).alias("date_key"),
+                pl.col("date").dt.date().alias("full_date"),
+                pl.col("date").dt.weekday().alias("day_of_week"),
+                pl.col("date").dt.strftime("%A").alias("day_name"),
+                pl.col("date").dt.month().alias("month_actual"),
+                pl.col("date").dt.strftime("%B").alias("month_name"),
+                pl.col("date").dt.year().alias("year_actual"),
+                pl.col("date").dt.quarter().alias("quarter_actual"),
+            ]
+        ).unique(subset=["date_key"])
+        df_dim_date.write_parquet(os.path.join(self.gold_dir, "dim_date.parquet"))
+
+        # Populate Fact Weather Hourly (Mapping Dimension Keys)
+        # Join with dim_location and dim_date to fetch the surrogate keys
+        df_fact_hourly = df_silver.join(
+            df_dim_location, left_on="location", right_on="location_name", how="inner"
+        )
+        df_fact_hourly = df_fact_hourly.with_columns(
+            pl.col("date").dt.strftime("%Y%m%d").cast(pl.Int32).alias("date_key")
         )
 
-        self.db.execute_query(
-            f"""
-            INSERT INTO gold.dim_date (
-                date_key, full_date, day_of_week, day_name, 
-                month_actual, month_name, year_actual, quarter_actual
+        df_fact_hourly_final = df_fact_hourly.select(
+            [
+                pl.col("date_key"),
+                pl.col("location_key"),
+                pl.col("date").alias("timestamp_utc"),
+                pl.col("temperature_2m"),
+                pl.col("relative_humidity_2m"),
+                pl.col("precipitation"),
+                pl.col("precipitation_probability"),
+                pl.col("weather_code"),
+            ]
+        ).unique(subset=["location_key", "timestamp_utc"])
+        df_fact_hourly_final.write_parquet(
+            os.path.join(self.gold_dir, "fact_weather_hourly.parquet")
+        )
+
+        # Populate Fact Weather Daily Summary (Analytical Business Aggregate)
+        # Truncate timestamp to date level for aggregation
+        df_daily_agg = (
+            df_fact_hourly_final.group_by(["date_key", "location_key"])
+            .agg(
+                [
+                    pl.col("temperature_2m").max().alias("max_temperature"),
+                    pl.col("temperature_2m").min().alias("min_temperature"),
+                    pl.col("temperature_2m").mean().round(2).alias("avg_temperature"),
+                    pl.col("precipitation").sum().round(2).alias("total_precipitation"),
+                    pl.col("precipitation_probability")
+                    .max()
+                    .alias("max_precipitation_probability"),
+                ]
             )
-            SELECT DISTINCT
-                TO_CHAR(date, 'YYYYMMDD')::INT AS date_key,
-                date::DATE AS full_date,
-                EXTRACT(ISODOW FROM date)::INT AS day_of_week,
-                TRIM(TO_CHAR(date, 'Day')) AS day_name,
-                EXTRACT(MONTH FROM date)::INT AS month_actual,
-                TRIM(TO_CHAR(date, 'Month')) AS month_name,
-                EXTRACT(YEAR FROM date)::INT AS year_actual,
-                EXTRACT(QUARTER FROM date)::INT AS quarter_actual
-            FROM {self.silver_table}
-            ON CONFLICT (date_key) DO NOTHING;
-        """
+            .sort(["date_key", "location_key"])
+        )
+        df_daily_agg.write_parquet(
+            os.path.join(self.gold_dir, "fact_weather_daily_summary.parquet")
         )
 
-    def _upsert_fact_hourly(self) -> None:
-        """Populates the granular hourly fact table incrementally."""
-        checkpoint = self.db.fetch_one(
-            "SELECT COALESCE(MAX(timestamp_utc), '1970-01-01'::TIMESTAMPTZ) FROM gold.fact_weather_hourly"
-        )[0]
-
-        self.db.execute_query(
-            f"""
-            WITH source_delta AS (
-                SELECT * FROM {self.silver_table} WHERE date > %s
-            )
-            INSERT INTO gold.fact_weather_hourly (
-                date_key, location_key, timestamp_utc, temperature_2m, 
-                relative_humidity_2m, precipitation, precipitation_probability, weather_code
-            )
-            SELECT 
-                d.date_key, l.location_key, s.date, s.temperature_2m, 
-                s.relative_humidity_2m, s.precipitation, s.precipitation_probability, s.weather_code
-            FROM source_delta s
-            JOIN gold.dim_location l ON s.location = l.location_name
-            JOIN gold.dim_date d ON s.date::DATE = d.full_date
-            ON CONFLICT (location_key, timestamp_utc) 
-            DO UPDATE SET
-                temperature_2m = EXCLUDED.temperature_2m,
-                relative_humidity_2m = EXCLUDED.relative_humidity_2m,
-                precipitation = EXCLUDED.precipitation,
-                precipitation_probability = EXCLUDED.precipitation_probability,
-                weather_code = EXCLUDED.weather_code;
-        """,
-            (checkpoint,),
-        )
-
-    def _upsert_fact_daily_summary(self) -> None:
-        """Calculates and stores daily aggregates incrementally."""
-        checkpoint = self.db.fetch_one(
-            """
-            SELECT COALESCE(MAX(d.full_date), '1970-01-01'::DATE) 
-            FROM gold.fact_weather_daily_summary f 
-            JOIN gold.dim_date d ON f.date_key = d.date_key
-        """
-        )[0]
-
-        self.db.execute_query(
-            """
-            WITH aggregated_daily AS (
-                SELECT 
-                    date_key,           -- FIXED: Dipindah ke posisi pertama
-                    location_key,       -- FIXED: Dipindah ke posisi kedua
-                    MAX(temperature_2m) AS max_temp,
-                    MIN(temperature_2m) AS min_temp,
-                    AVG(temperature_2m)::NUMERIC(5,2) AS avg_temp,
-                    SUM(precipitation)::NUMERIC(6,2) AS total_precip,
-                    MAX(precipitation_probability) AS max_prob
-                FROM gold.fact_weather_hourly
-                WHERE timestamp_utc::DATE >= %s
-                GROUP BY date_key, location_key
-            )
-            INSERT INTO gold.fact_weather_daily_summary (
-                date_key, location_key, max_temperature, min_temperature, 
-                avg_temperature, total_precipitation, max_precipitation_probability
-            )
-            SELECT * FROM aggregated_daily
-            ON CONFLICT (location_key, date_key) 
-            DO UPDATE SET
-                max_temperature = EXCLUDED.max_temperature,
-                min_temperature = EXCLUDED.min_temperature,
-                avg_temperature = EXCLUDED.avg_temperature,
-                total_precipitation = EXCLUDED.total_precipitation,
-                max_precipitation_probability = EXCLUDED.max_precipitation_probability;
-        """,
-            (checkpoint,),
-        )
+        logger.success("Gold layer Star Schema files (.parquet) successfully compiled.")
